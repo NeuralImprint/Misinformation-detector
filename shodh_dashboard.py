@@ -1,8 +1,6 @@
 import streamlit as st
 import feedparser
 import urllib.parse
-from sentence_transformers import SentenceTransformer, util
-import whisper
 import cv2
 import numpy as np
 import torch
@@ -15,14 +13,16 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import os
 import tempfile
-import librosa
+import gc
 
-# --- CONFIGURATION & MODEL LOADING ---
-ST_DEVICE = "cpu"  # Streamlit Cloud does not have GPU
+# --- CONFIGURATION ---
+ST_DEVICE = "cpu"
+
+# --- LAZY MODEL LOADERS (load only when needed, not all at once) ---
 
 @st.cache_resource
 def load_deepfake_model():
-    """Load the EfficientNetV2-S classifier using timm with custom 5-class head."""
+    """Load the EfficientNetV2-S classifier in float16 to save memory."""
     try:
         import timm
         model = timm.create_model('tf_efficientnetv2_s', num_classes=5)
@@ -37,40 +37,31 @@ def load_deepfake_model():
             state_dict = torch.load(weights_path, map_location=ST_DEVICE)
             new_state_dict = {k.replace("base_model.", ""): v for k, v in state_dict.items()}
             model.load_state_dict(new_state_dict)
+            model.half()  # Convert to float16 — halves memory usage
             model.eval().to(ST_DEVICE)
             return model, True
         return None, False
     except Exception as e:
-        st.error(f"Error loading Deepfake weights: {e}")
         return None, False
 
 @st.cache_resource
-def load_audio_deepfake_model():
-    """Load a pre-trained audio deepfake detector."""
-    try:
-        from transformers import pipeline
-        return pipeline("audio-classification", model="MIT/ast-finetuned-audioset-10-10-0.4593")
-    except Exception as e:
-        st.error(f"Error loading Audio model: {e}")
-        return None
-
-@st.cache_resource
 def load_whisper_model():
-    """Load Whisper speech-to-text model."""
+    """Load Whisper tiny model — uses ~40MB vs 150MB for base."""
     try:
-        return whisper.load_model("base", device=ST_DEVICE)
-    except Exception as e:
-        st.warning(f"Whisper load issue: {e}")
+        import whisper
+        return whisper.load_model("tiny", device=ST_DEVICE)
+    except Exception:
         return None
 
 @st.cache_resource
 def load_sentence_transformer():
-    """Load sentence similarity model for fact-checking."""
+    """Load a lightweight sentence model for fact-checking."""
+    from sentence_transformers import SentenceTransformer
     return SentenceTransformer('all-MiniLM-L6-v2')
 
 @st.cache_resource
 def get_face_detector():
-    """Initialize MediaPipe Face Detector using the Tasks API."""
+    """Initialize MediaPipe Face Detector."""
     model_path = os.path.join(os.path.dirname(__file__), "blaze_face_short_range.tflite")
     if not os.path.exists(model_path):
         import urllib.request
@@ -88,6 +79,7 @@ def get_face_detector():
 
 def verify_claim(claim, sentence_model):
     """Search Google News RSS and compare semantic similarity."""
+    from sentence_transformers import util
     encoded_query = urllib.parse.quote(claim[:200])
     url = f"https://news.google.com/rss/search?q={encoded_query}"
     feed = feedparser.parse(url)
@@ -107,7 +99,7 @@ def preprocess_face(face_img):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     pil_img = Image.fromarray(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
-    return preprocess(pil_img).unsqueeze(0).to(ST_DEVICE)
+    return preprocess(pil_img).unsqueeze(0).to(ST_DEVICE).half()  # float16
 
 def analyze_visual(frame, model, face_detector):
     """Detect faces in a frame and classify each as real/fake."""
@@ -127,8 +119,10 @@ def analyze_visual(frame, model, face_detector):
             continue
         input_t = preprocess_face(face)
         with torch.no_grad():
-            probs = F.softmax(model(input_t), dim=1)
-            scores.append(probs[0][0].item())  # Class 0 = Real (FF++ convention)
+            probs = F.softmax(model(input_t).float(), dim=1)  # Cast back to float32 for softmax
+            scores.append(probs[0][0].item())  # Class 0 = Real
+        del input_t  # Free memory immediately
+    gc.collect()
     return np.mean(scores) if scores else 0.5
 
 # --- STREAMLIT UI ---
@@ -143,21 +137,15 @@ uploaded_file = st.file_uploader(
     type=["mp4", "wav", "mp3", "jpg", "png", "jpeg", "avi", "mkv", "webm", "ogg", "flac"]
 )
 
+# Only load models on demand, show status in sidebar
 with st.sidebar:
     st.header("⚙️ System Status")
-    df_model, df_ok = load_deepfake_model()
-    st.write(f"Visual AI: {'✅ Loaded' if df_ok else '❌ Error'}")
-    audio_df_model = load_audio_deepfake_model()
-    st.write(f"Audio AI: {'✅ Loaded' if audio_df_model else '❌ Error'}")
-    whisper_model = load_whisper_model()
-    st.write(f"Transcription: {'✅ Loaded' if whisper_model else '❌ Error'}")
-    sentence_model = load_sentence_transformer()
-    st.write("Fact-Checker: ✅ Loaded")
+    st.caption("Models load on first use to save memory.")
     st.divider()
     st.caption("Built with ❤️ by Shodh AI")
 
 if uploaded_file:
-    file_type = uploaded_file.type.split('/')[0]  # 'image', 'video', or 'audio'
+    file_type = uploaded_file.type.split('/')[0]
     ext = uploaded_file.name.split('.')[-1].lower()
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
@@ -179,33 +167,35 @@ if uploaded_file:
     with col_res:
         st.subheader("🔬 AI Analysis Report")
 
-        # --- Run Full Scan ---
         if st.button("🚀 Run Full Security Scan", type="primary"):
             vis_score, aud_score, transcript = None, None, None
 
-            # 1. Visual Analysis (Image or Video)
-            if file_type in ['image', 'video'] and df_ok:
-                with st.spinner("🔍 Analyzing Visual Integrity..."):
-                    if file_type == 'image':
-                        img = cv2.imread(tmp_path)
-                        if img is not None:
-                            vis_score = analyze_visual(img, df_model, get_face_detector())
-                    else:
-                        cap = cv2.VideoCapture(tmp_path)
-                        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                        frame_scores = []
-                        sample_count = min(10, total)
-                        for i in range(0, total, max(1, total // sample_count)):
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-                            ret, frame = cap.read()
-                            if ret:
-                                s = analyze_visual(frame, df_model, get_face_detector())
-                                if s is not None:
-                                    frame_scores.append(s)
-                        cap.release()
-                        vis_score = np.mean(frame_scores) if frame_scores else None
+            # 1. Visual Analysis (Image or Video) — loads deepfake model on demand
+            if file_type in ['image', 'video']:
+                with st.spinner("🔍 Loading Visual AI & Analyzing..."):
+                    df_model, df_ok = load_deepfake_model()
+                    if df_ok:
+                        if file_type == 'image':
+                            img = cv2.imread(tmp_path)
+                            if img is not None:
+                                vis_score = analyze_visual(img, df_model, get_face_detector())
+                        else:
+                            cap = cv2.VideoCapture(tmp_path)
+                            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                            frame_scores = []
+                            sample_count = min(5, total)  # Reduced samples for memory
+                            for i in range(0, total, max(1, total // sample_count)):
+                                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+                                ret, frame = cap.read()
+                                if ret:
+                                    s = analyze_visual(frame, df_model, get_face_detector())
+                                    if s is not None:
+                                        frame_scores.append(s)
+                            cap.release()
+                            vis_score = np.mean(frame_scores) if frame_scores else None
+                    gc.collect()
 
-            # 2. Audio & Speech Analysis (Video or Audio)
+            # 2. Audio & Speech (Video or Audio) — loads whisper on demand
             if file_type in ['video', 'audio']:
                 with st.spinner("🎧 Processing Audio & Speech..."):
                     audio_path = tmp_path
@@ -223,30 +213,26 @@ if uploaded_file:
 
                     if audio_path and os.path.exists(audio_path):
                         try:
+                            import librosa
                             audio_arr, _ = librosa.load(audio_path, sr=16000)
 
-                            # Audio authenticity check
-                            if audio_df_model:
-                                ads = audio_df_model(audio_arr)
-                                for r in ads:
-                                    if r['label'] == "Speech synthesizer":
-                                        aud_score = r['score']
-
-                            # Speech-to-text
+                            # Speech-to-text (Whisper tiny)
+                            whisper_model = load_whisper_model()
                             if whisper_model:
                                 transcript = whisper_model.transcribe(audio_arr)["text"]
+                            del audio_arr
+                            gc.collect()
                         except Exception:
                             pass
 
-            # Save results to session state
+            # Save results
             st.session_state['v_score'] = vis_score
             st.session_state['a_score'] = aud_score
             st.session_state['script'] = transcript
-            # Clear old fact-check results
             st.session_state.pop('fact_score', None)
             st.session_state.pop('fact_articles', None)
 
-        # --- Display Results (persisted via session state) ---
+        # --- Display Results ---
         if 'v_score' in st.session_state and st.session_state['v_score'] is not None:
             st.metric("Visual Trust Score", f"{st.session_state['v_score']:.2%}")
             if st.session_state['v_score'] < 0.5:
@@ -254,24 +240,18 @@ if uploaded_file:
             else:
                 st.success("✅ Real-Source Video Match")
 
-        if 'a_score' in st.session_state and st.session_state['a_score'] is not None:
-            st.metric("Audio Synthetic Probability", f"{st.session_state['a_score']:.2%}")
-            if st.session_state['a_score'] > 0.3:
-                st.error("🚩 AI-Generated Voice Detected!")
-            else:
-                st.success("✅ Natural Human Audio")
-
         if 'script' in st.session_state and st.session_state['script']:
             st.subheader("📝 Speech-to-Text Verification")
             edited_script = st.text_area(
                 "Verify and edit the detected speech before fact-checking:",
                 value=st.session_state['script'],
                 height=150,
-                help="The AI transcription may have errors. Edit before running fact-check for best results."
+                help="The AI transcription may have errors. Edit before running fact-check."
             )
 
             if st.button("🔍 Fact-Check this Script"):
                 with st.spinner("Searching Global News Sources..."):
+                    sentence_model = load_sentence_transformer()
                     score, articles = verify_claim(edited_script, sentence_model)
                     st.session_state['fact_score'] = score
                     st.session_state['fact_articles'] = articles
@@ -290,7 +270,6 @@ if uploaded_file:
                 for a in st.session_state['fact_articles']:
                     st.write(f"- {a}")
 
-    # Cleanup temp file
     try:
         os.unlink(tmp_path)
     except Exception:
@@ -301,6 +280,7 @@ st.subheader("🔍 Quick Claim Fact-Checker")
 manual_claim = st.text_input("Type a claim to verify manually:")
 if manual_claim:
     with st.spinner("Checking..."):
+        sentence_model = load_sentence_transformer()
         s, a = verify_claim(manual_claim, sentence_model)
         st.metric("Truth Score", f"{s:.2%}")
         if a:
