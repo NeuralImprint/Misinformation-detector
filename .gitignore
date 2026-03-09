@@ -7,20 +7,16 @@ env/
 venv/
 ENV/
 
-# Streamlit
-.streamlit/
+# IDE
+.vscode/
+.idea/
 
-# Models & Large Files (Optional - keep if you want them on GitHub)
-# *.pth 
-# *.tflite
-# *.task
-
-# Media & Temp
-tmp*
-*.mp4
-*.wav
-*.mp3
-*.jpg
-*.png
-*.jpeg
+# OS
 .DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+
+# Desktop-only app (not needed for cloud)
+# scanner_app.py is kept in repo but not used by Streamlit Cloud
